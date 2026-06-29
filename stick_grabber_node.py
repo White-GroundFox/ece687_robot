@@ -1,276 +1,178 @@
+#!/usr/bin/env python3
+"""
+stick_grabber_node.py  -- COMPLIANT REWRITE of the teammate's arm/gripper node.
+
+WHY THE OLD VERSION GOT STUCK IN THE AIR
+  The EP arm is a 2-link arm that moves the gripper in the robot's
+  FORWARD-VERTICAL (x = reach, z = height) plane.  It CANNOT move the gripper
+  horizontally side to side.  The old code computed the stick target in the
+  HORIZONTAL world x-y plane, ran a 2R forward-kinematics on it, then published
+  Vector3(x=err_x, z=err_y) -- feeding a horizontal y-error into the vertical z
+  command.  The arm chased a horizontal error it can never null and parked in
+  the air.  (The world->body rotation was also wrong.)
+
+CORRECT DIVISION OF LABOUR (matches PDF: "define p to coincide with the stick tip")
+  * HORIZONTAL alignment to the stick is the CHASSIS's job -> move_robot_node.py
+    drives the gripper point p onto the stick.
+  * THIS node only sets the arm HEIGHT/REACH (x,z) to a known grasp posture and
+    works the gripper.  The sticks sit at a known height, so the grasp posture
+    is a calibrated constant, not something computed from mocap.  No horizontal
+    IK on the arm.
+
+SEQUENCE (T2 "pick up a stick"):
+  OPEN     : open the gripper
+  SET_ARM  : command the arm to the grasp posture (x = reach, z = height)
+  WAIT_ARM : wait until the arm reaches it (arm_position feedback, or timeout)
+  CLOSE    : close the gripper on the stick
+  DONE     : hold
+
+Run (inside the container; align the robot first, or test by hand):
+  python3 stick_grabber_node.py --ros-args \
+    -p robot:=robot3 -p arm_x:=0.18 -p arm_z:=0.02
+Tune arm_x (forward reach) and arm_z (height) until the open gripper sits
+around the stick when the chassis has it lined up.
+"""
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient
-from geometry_msgs.msg import Vector3, PoseStamped
-from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Point, PointStamped
 from robomaster_msgs.action import GripperControl
-import numpy as np
-import math
+
+
+# gripper target_state values (robomaster_ros): 0=pause, 1=open, 2=close
+GRIPPER_OPEN = 1
+GRIPPER_CLOSE = 2
+
 
 class StickGrabberNode(Node):
     def __init__(self):
         super().__init__('stick_grabber_node')
-        self.get_logger().info("Stick Grabber Node initialized.")
-        mocap_qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                depth=10
-            )
-        # TODO: Get the robot link dimensions
-        # Constants for the robot
-        self._a1 = 0.22
-        self._a2 = 0.15
-        self._error_treshold = 0.04 # 4 cm threshold
-        self.sign = -1
-        # Initialize variables to store the robot's joint states and the desired pose
-        self.joint_positions = None
-        self.joint_velocities = None
-        self.desired_pose = None
-        self.robot_pose = None
-        self.robot_pose_orientation = None
 
-        # Initialize robot phase between 0 and 1
-        # 0 is INIT_OPEN_GRIPPER
-        # 1 is MOVE_TO_STICK
-        # 2 is CLOSE_GRIPPER
-        # 3 is DONE
-        self._currentPhase = 0
+        robot = self.declare_parameter('robot', 'robot3').value
 
-        self._gripper_action_running = False
-        # Assume the gripper is always closed at the start of the program
-        # This way we can ensure the gripper is open
-        self.gripper_open = False
+        # Grasp posture in the arm's FORWARD-VERTICAL plane (metres).
+        #   arm_x = forward reach,  arm_z = height.  CALIBRATE these to the stick.
+        self.arm_x = self.declare_parameter('arm_x', 0.18).value
+        self.arm_z = self.declare_parameter('arm_z', 0.02).value
+        self.arm_tol = self.declare_parameter('arm_tol', 0.02).value     # arrival tol (m)
+        self.arm_timeout = self.declare_parameter('arm_timeout', 4.0).value  # s
+        self.grip_power = self.declare_parameter('grip_power', 0.7).value
 
-        # Create subscription to the stick target position
-        self.create_subscription(PoseStamped, '/vrpn_mocap/hockey_sticks_1/pose', self.stick_mocap_callback, mocap_qos)  
-        # Create subscription to joint states
-        self.create_subscription(JointState, '/robot3/joint_states', self.joint_states_callback, mocap_qos)
-        # Create subscription to robot base
-        self.create_subscription(PoseStamped, '/vrpn_mocap/dji_robot_3/pose', self.robot_pose_callback, mocap_qos)
-
-        # Action Client Configuration
+        # ---- interfaces -----------------------------------------------------
         self.cb_group = ReentrantCallbackGroup()
-        self.gripper_client = ActionClient(self, GripperControl, '/robot3/gripper', callback_group=self.cb_group)
-    
-        # Arm Publisher
-        self.arm_pub = self.create_publisher(Vector3, '/robot3/cmd_arm', 10)
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
 
-        self.get_logger().info("Connecting to gripper action server...")
-        if not self.gripper_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("Gripper server discovery timed out! Attempting sequence anyway...")
+        # Absolute arm target in (x=reach, z=height); robomaster_ros arm driver.
+        self.arm_pub = self.create_publisher(Point, f'/{robot}/target_arm_position', 10)
+        # Arm feedback (x,z); used to detect when the posture is reached.
+        self.arm_pos = None
+        self.create_subscription(PointStamped, f'/{robot}/arm_position',
+                                 self._on_arm_pos, qos)
 
-        self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Closed-Loop Feedback Grabber Node initialized. Awaiting MoCap data stream...")
-    
-    def _compute_forward_kinematics(self, robot_pose):
-        """
-        Compute the forward kinematics for the RR Manupilator
-        We need the x,y position of the end effector from the Robot Pose
-        """
-        theta1, theta2 = robot_pose
-        c1 = math.cos(theta1)
-        c12 = math.cos(theta1 + theta2)
-        s1 = math.sin(theta1)
-        s12 = math.sin(theta1 + theta2)
-        x = self._a1 * c1 + self._a2 * c12
-        y = self._a1 * s1 + self._a2 * s12
-        return np.array([x, y])
-    
-    def robot_pose_callback(self, msg):
-        self.robot_pose = np.array([msg.pose.position.x, msg.pose.position.y])
-        self.robot_pose_orientation = msg.pose.orientation
+        self.gripper = ActionClient(self, GripperControl, f'/{robot}/gripper',
+                                    callback_group=self.cb_group)
 
-    def joint_states_callback(self, msg):
-        """
-        Callback functin to get the joint position and velocities
-        """
-        try:
-            idx1 = msg.name.index('robot3/arm_1_joint')
-            idx2 = msg.name.index('robot3/arm_2_joint')
-            self.joint_positions = np.array([msg.position[idx1], msg.position[idx2]])
-            self.joint_velocities = np.array([msg.velocity[idx1], msg.velocity[idx2]])
-            print(f"SYED-DEBUG: Joint Positions: {self.joint_positions}, Joint Velocities: {self.joint_velocities}")
-        except ValueError:
-            self.get_logger().error("Arm joint names not found in JointState message!")
+        # ---- state machine --------------------------------------------------
+        self.phase = 'OPEN'
+        self._busy = False           # a gripper action is in flight
+        self._arm_clock = None       # time we first commanded the arm
 
-    def stick_mocap_callback(self, msg):
-        """
-        Callback function to get the stick's pose, which is also the desired pos for the 
-        End Effector
-        """
-        if self.robot_pose is None:
-            self.get_logger().warn("Robot pose not yet received. Waiting for MoCap data...")
-            return
-        print(f"SYED-DEBUG: Stick Pose: {msg.pose.position.x}, {msg.pose.position.y}, {msg.pose.orientation}")
-        stick_global = np.array([msg.pose.position.x, msg.pose.position.y])
-        self.desired_pose = self._convert_to_robot_base_coodinates(stick_global)
-        print(f"SYED-DEBUG: Desired Pose: {self.desired_pose}")
+        self.get_logger().info('Connecting to gripper action server...')
+        if not self.gripper.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Gripper server not found; will retry in loop.')
 
+        self.timer = self.create_timer(0.1, self.control_loop)   # 10 Hz
+        self.get_logger().info('stick_grabber_node started. Phase OPEN.')
+
+    # ------------------------------------------------------------------ I/O
+    def _on_arm_pos(self, msg: PointStamped):
+        self.arm_pos = (msg.point.x, msg.point.z)
+
+    def _arm_reached(self) -> bool:
+        if self.arm_pos is None:
+            return False   # no feedback yet -> rely on timeout instead
+        dx = self.arm_pos[0] - self.arm_x
+        dz = self.arm_pos[1] - self.arm_z
+        return (dx * dx + dz * dz) ** 0.5 < self.arm_tol
+
+    # ------------------------------------------------------- state machine
     def control_loop(self):
-        # Return if the robot pose or desired pose is not yet received
-        if self.joint_positions is None or self.joint_velocities is None or self.desired_pose is None:
-            if self.joint_positions is None or self.joint_velocities is None:
-                self.get_logger().warn("Robot joint states not yet received. Waiting for MoCap data...")
-            if self.desired_pose is None:
-                self.get_logger().warn("Stick pose not yet received. Waiting for MoCap data...")
-            return
-        
-        # Ensure the gripper is open before moving towards the desired pose
-        if self._currentPhase == 0:
-            self.get_logger().info("Gripper is closed. Opening gripper before moving towards the desired pose.")
-            self._send_gripper_goal(1) # 1 = OPEN
+        if self._busy:
             return
 
-        pos_error = self._compute_error_vectors()
-        pos_error_norm = np.linalg.norm(pos_error)
-        # print(f"SYED-DEBUG: Pos Error: {pos_error}")
-        # msg = Vector3(
-        #     x = float(0.35),
-        #     y = 0.0,
-        #     z = float(self.sign*0.46)
-        # )
-        # self.sign *= -1
-        # self.arm_pub.publish(msg)
-        # pos_error = self._compute_error_vectors()
-        # pos_error_norm = np.linalg.norm(pos_error)
-        print(f"SYED-DEBUG: Current Phase: {self._currentPhase}")
-        if self._currentPhase == 1:
-            if pos_error_norm < self._error_treshold:
-                self.get_logger().info("End Effector is within the error treshold. Stopping the robot and closing the gripper")
-                # Manupilator should not be moving since it is at the desired position
-                stop_msg = Vector3(x=0.0, y=0.0, z=0.0)
-                self.arm_pub.publish(stop_msg)
-                self._currentPhase = 2
-            else:
-                self.get_logger().info("End Effector is outside the error treshold. Moving towards the desired pose")
-                print(f"SYED-DEBUG: Sending positions: {pos_error}")
-                msg = Vector3(
-                    x = float(pos_error[0]),
-                    y = 0.0,
-                    z = float(pos_error[1])
-                )
-                self.arm_pub.publish(msg)
-                print(f"SYED-DEBUG: Published the command for {msg}")
-        elif self._currentPhase == 2:
-            self.get_logger().info("End Effector is within the error treshold. Closing the gripper")
-            if not self.gripper_client.wait_for_server(timeout_sec=5.0):
-                self.get_logger().error("Gripper server discovery timed out! Attempting sequence anyway...")
-            if not self._gripper_action_running:
-                self._send_gripper_goal(2)
-        elif self._currentPhase == 3:
-            self.get_logger().info("Gripper is closed. Task completed.")
-            # Stop the robot
-            stop_msg = Vector3(x=0.0, y=0.0, z=0.0)
-            self.arm_pub.publish(stop_msg)
-        else:
-            self.get_logger().error(f"Unknown phase: {self._currentPhase}. Resetting to phase 0.")
-            self._currentPhase = 0
+        if self.phase == 'OPEN':
+            self._send_gripper(GRIPPER_OPEN)        # -> advances to SET_ARM
 
+        elif self.phase == 'SET_ARM':
+            self.arm_pub.publish(Point(x=float(self.arm_x), y=0.0, z=float(self.arm_z)))
+            self._arm_clock = self.get_clock().now()
+            self.get_logger().info(f'Arm -> grasp posture (x={self.arm_x}, z={self.arm_z})')
+            self.phase = 'WAIT_ARM'
 
-    def _send_gripper_goal(self, state_value):
-        self._gripper_action_running = True
-        goal_msg = GripperControl.Goal()
-        goal_msg.target_state = state_value
-        print(f"SYED-DEBUG: Sending gripper goal with state value: {state_value}")
-        send_goal_future = self.gripper_client.send_goal_async(goal_msg)
-        send_goal_future.add_done_callback(self._gripper_response_callback)
+        elif self.phase == 'WAIT_ARM':
+            # keep commanding the target so the driver holds it
+            self.arm_pub.publish(Point(x=float(self.arm_x), y=0.0, z=float(self.arm_z)))
+            elapsed = (self.get_clock().now() - self._arm_clock).nanoseconds * 1e-9
+            if self._arm_reached() or elapsed > self.arm_timeout:
+                self.get_logger().info('Arm in place -> CLOSE')
+                self.phase = 'CLOSE'
 
-    def _gripper_response_callback(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error("Gripper action goal rejected!")
-            self._gripper_action_running = False
+        elif self.phase == 'CLOSE':
+            self._send_gripper(GRIPPER_CLOSE)       # -> advances to DONE
+
+        elif self.phase == 'DONE':
+            pass   # hold posture; nothing to do
+
+    # ------------------------------------------------------- gripper action
+    def _send_gripper(self, state_value):
+        if not self.gripper.server_is_ready():
+            self.gripper.wait_for_server(timeout_sec=1.0)
+            return  # try again next tick
+        self._busy = True
+        goal = GripperControl.Goal()
+        goal.target_state = state_value
+        goal.power = float(self.grip_power)
+        self.get_logger().info(f'Gripper -> {"OPEN" if state_value == GRIPPER_OPEN else "CLOSE"}')
+        self.gripper.send_goal_async(goal).add_done_callback(self._goal_response)
+
+    def _goal_response(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().error('Gripper goal rejected; retrying.')
+            self._busy = False
             return
+        handle.get_result_async().add_done_callback(self._goal_done)
 
-        self.get_logger().info("Gripper action goal accepted. Waiting for result...")
-        get_result_future = goal_handle.get_result_async()
-        get_result_future.add_done_callback(self._gripper_result_callback)
+    def _goal_done(self, _):
+        if self.phase == 'OPEN':
+            self.get_logger().info('Gripper open -> SET_ARM')
+            self.phase = 'SET_ARM'
+        elif self.phase == 'CLOSE':
+            self.get_logger().info('Stick grasped -> DONE')
+            self.phase = 'DONE'
+        self._busy = False
 
-    def _gripper_result_callback(self, future):
-        result = future.result()
-        self.get_logger().info(f"Gripper action result: {result}")
-        if self._currentPhase == 0:
-            self.get_logger().info("Gripper opened successfully. Moving to phase 1: MOVE_TO_STICK")
-            self._currentPhase = 1
-        elif self._currentPhase == 2:
-            self.get_logger().info("Gripper closed successfully. Task completed. Moving to phase 3: DONE")
-            self._currentPhase = 3
-        self._gripper_action_running = False
-
-    def _compute_error_vectors(self):
-        """
-        Compute the error vectors between the desired pose and the current pose
-        position error and velocity error. The target velocity is assumed to be zero since we
-        want to stop at the desired position
-        """
-        current_ee_pose = self._compute_forward_kinematics(self.joint_positions)
-        position_error = self.desired_pose - current_ee_pose
-        return position_error
-    
-    # convert everything into local coordinates of robot
-    def _convert_to_robot_base_coodinates(self, global_pos):
-        translation_error = global_pos - self.robot_pose
-
-        q = self.robot_pose_orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        local_x = translation_error[0] * math.sin(yaw) - translation_error[1] * math.cos(yaw)
-        local_y = translation_error[0] * math.cos(yaw) + translation_error[1] * math.sin(yaw)
-        print(f"SYED-DEBUG: Local Coordinates: {local_x}, {local_y}")
-        return np.array([local_x, local_y])
 
 def main(args=None):
     rclpy.init(args=args)
-    node = StickGrabberNode() # Make sure this matches your exact class name
-
+    node = StickGrabberNode()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
         executor.spin()
     except KeyboardInterrupt:
-        node.get_logger().info("Keyboard Interrupt caught. Stopping arm...")
+        node.get_logger().info('Interrupted; stopping.')
     finally:
-        # 1. Clear out movement while the publisher handle is fully alive and valid
-        try:
-            stop_msg = Vector3(x=0.0, y=0.0, z=0.0)
-            node.arm_pub.publish(stop_msg)
-        except Exception as e:
-            print(f"Could not send safety stop: {e}")
-
-        # 2. Shutdown the executor threads safely
         executor.shutdown()
         node.destroy_node()
-        
-        # 3. Only shutdown rclpy if context wasn't wiped out already
         if rclpy.ok():
             rclpy.shutdown()
 
-if __name__ == '__main__':
-    main()
 
 if __name__ == '__main__':
     main()
 
-"""
-Creating ros2 package steps
-cd /root/ros2_ws/src
-ros2 pkg create --build-type ament_python robot_controller --dependencies rclpy geometry_msgs sensor_msgs robomaster_msgs
-cd <your_package_name>/<your_package_name>/
-touch stick_grabber_node.py
-chmod +x stick_grabber_node.py
-
-in setup.py
-entry_points={
-        'console_scripts': [
-            'stick_grabber_node = your_package_name.stick_grabber_node:main',
-        ],
-    },
-
-cd /root/ros2_ws
-colcon build --packages-select <your_package_name> --symlink-install
-source install/setup.bash
-ros2 run <your_package_name> stick_grabber_node
-"""
